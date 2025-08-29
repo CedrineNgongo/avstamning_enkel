@@ -1,3 +1,5 @@
+
+
 # fil: avstamning_master.py
 # Master-pipeline: K1 → K2 → K3 → K4 → K5 → K6
 # - K5 (LB) enligt sex-stegsreglerna från dig.
