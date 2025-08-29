@@ -1,5 +1,3 @@
-
-
 # fil: avstamning_master.py
 # Master-pipeline: K1 → K2 → K3 → K4 → K5 → K6
 # - K5 (LB) enligt sex-stegsreglerna från dig.
@@ -836,48 +834,81 @@ def main():
 if __name__ == "__main__":
     main()
 
-# === Lägg detta längst ned i avstamning_master.py ===
+# === Pipeline för webben: returnerar en XLSX som bytes ===
 from pathlib import Path
 import tempfile
 import pandas as pd
 
 def build_output_excel_bytes(bank_path: str, bokf_path: str) -> bytes:
+    # 1) Läs in
     bank_all = load_bank(bank_path)
     bokf_all = load_bokf(bokf_path)
 
-    bank_rem = bank_all.copy(); bokf_rem = bokf_all.copy()
+    # 2) K1–K5 på rester
+    bank_rem = bank_all.copy()
+    bokf_rem = bokf_all.copy()
     matched_bank_list, matched_bokf_list = [], []
 
-    for cat, func in [("K1",run_category1_BG53782751),
-                      ("K2",run_category2_BG5341_7689),
-                      ("K3",run_category3_35ref),
-                      ("K4",run_category4_ovrigt),
-                      ("K5",run_category5_LB)]:
+    for cat, func in [
+        ("K1", run_category1_BG53782751),
+        ("K2", run_category2_BG5341_7689),
+        ("K3", run_category3_35ref),
+        ("K4", run_category4_ovrigt),
+        ("K5", run_category5_LB),
+    ]:
         mb, mf = func(bank_rem, bokf_rem)
-        if not mb.empty: mb = mb.copy(); mb["__MatchKategori__"] = cat
-        if not mf.empty: mf = mf.copy(); mf["__MatchKategori__"] = cat
-        matched_bank_list.append(mb); matched_bokf_list.append(mf)
-        if not mb.empty: bank_rem = bank_rem[~bank_rem["BankRowID"].isin(mb["BankRowID"])]
-        if not mf.empty: bokf_rem = bokf_rem[~bokf_rem["BokfRowID"].isin(mf["BokfRowID"])]
+        if not mb.empty:
+            mb = mb.copy()
+            mb["__MatchKategori__"] = cat
+        if not mf.empty:
+            mf = mf.copy()
+            mf["__MatchKategori__"] = cat
+        matched_bank_list.append(mb)
+        matched_bokf_list.append(mf)
 
+        if not mb.empty:
+            bank_rem = bank_rem[~bank_rem["BankRowID"].isin(mb["BankRowID"])]
+        if not mf.empty:
+            bokf_rem = bokf_rem[~bokf_rem["BokfRowID"].isin(mf["BokfRowID"])]
+
+    # 3) K6 på rester
     mb6, mf6 = run_category6_symmetric(bank_rem, bokf_rem)
-    if not mb6.empty: mb6["__MatchKategori__"] = "K6"
-    if not mf6.empty: mf6["__MatchKategori__"] = "K6"
-    matched_bank_list.append(mb6); matched_bokf_list.append(mf6)
+    if not mb6.empty:
+        mb6["__MatchKategori__"] = "K6"
+    if not mf6.empty:
+        mf6["__MatchKategori__"] = "K6"
+    matched_bank_list.append(mb6)
+    matched_bokf_list.append(mf6)
 
-    matched_bank_all = pd.concat([d for d in matched_bank_list if not d.empty], ignore_index=True) if any((not d.empty for d in matched_bank_list)) else bank_all.iloc[0:0].copy()
-    matched_bokf_all = pd.concat([d for d in matched_bokf_list if not d.empty], ignore_index=True) if any((not d.empty for d in matched_bokf_list)) else bokf_all.iloc[0:0].copy()
+    # 4) Sammanställ alla matchade / omatchade
+    matched_bank_all = (
+        pd.concat([d for d in matched_bank_list if not d.empty], ignore_index=True)
+        if any((not d.empty for d in matched_bank_list))
+        else bank_all.iloc[0:0].copy()
+    )
+    matched_bokf_all = (
+        pd.concat([d for d in matched_bokf_list if not d.empty], ignore_index=True)
+        if any((not d.empty for d in matched_bokf_list))
+        else bokf_all.iloc[0:0].copy()
+    )
 
-    if "__MatchKategori__" not in matched_bank_all.columns: matched_bank_all["__MatchKategori__"] = pd.Series(dtype=str)
-    if "__MatchKategori__" not in matched_bokf_all.columns: matched_bokf_all["__MatchKategori__"] = pd.Series(dtype=str)
+    if "__MatchKategori__" not in matched_bank_all.columns:
+        matched_bank_all["__MatchKategori__"] = pd.Series(dtype=str)
+    if "__MatchKategori__" not in matched_bokf_all.columns:
+        matched_bokf_all["__MatchKategori__"] = pd.Series(dtype=str)
 
-    om_bank_all = bank_all[~bank_all["BankRowID"].isin(matched_bank_all.get("BankRowID", pd.Series(dtype=int)))].copy()
-    om_bokf_all = bokf_all[~bokf_all["BokfRowID"].isin(matched_bokf_all.get("BokfRowID", pd.Series(dtype=int)))].copy()
+    om_bank_all = bank_all[
+        ~bank_all["BankRowID"].isin(matched_bank_all.get("BankRowID", pd.Series(dtype=int)))
+    ].copy()
+    om_bokf_all = bokf_all[
+        ~bokf_all["BokfRowID"].isin(matched_bokf_all.get("BokfRowID", pd.Series(dtype=int)))
+    ].copy()
 
+    # 5) Bygg MatchGruppID-mappning
     mapping_bank, mapping_bokf = {}, {}
 
     # K1, K2, K5 – grupp per datum
-    for cat in ["K1","K2","K5"]:
+    for cat in ["K1", "K2", "K5"]:
         mb_cat = df_by_cat(matched_bank_all, cat)
         mf_cat = df_by_cat(matched_bokf_all, cat)
         for d in mb_cat["Bokföringsdatum"].dropna().dt.date.unique():
@@ -888,19 +919,25 @@ def build_output_excel_bytes(bank_path: str, bokf_path: str) -> bytes:
                 mapping_bokf[fid] = (cat, gid)
 
     # K3, K4 – 1–1
-    for cat in ["K3","K4"]:
+    for cat in ["K3", "K4"]:
         mbc = df_by_cat(matched_bank_all, cat).reset_index(drop=True)
         mfc = df_by_cat(matched_bokf_all, cat).reset_index(drop=True)
         n = min(len(mbc), len(mfc))
         for i in range(n):
             gid = f"{cat}-{i+1:06d}"
-            mapping_bank[mbc.loc[i,"BankRowID"]] = (cat, gid)
-            mapping_bokf[mfc.loc[i,"BokfRowID"]] = (cat, gid)
+            mapping_bank[mbc.loc[i, "BankRowID"]] = (cat, gid)
+            mapping_bokf[mfc.loc[i, "BokfRowID"]] = (cat, gid)
 
-    # K6 – grupper
-    for side, df_all, mapping in [("Bank", matched_bank_all, mapping_bank),
-                                  ("Bokf", matched_bokf_all, mapping_bokf)]:
-        df_k6 = df_all[df_all["__MatchKategori__"] == "K6"] if "__MatchKategori__" in df_all.columns else df_all.iloc[0:0]
+    # K6 – från __GroupKey__
+    for side, df_all, mapping in [
+        ("Bank", matched_bank_all, mapping_bank),
+        ("Bokf", matched_bokf_all, mapping_bokf),
+    ]:
+        df_k6 = (
+            df_all[df_all["__MatchKategori__"] == "K6"]
+            if "__MatchKategori__" in df_all.columns
+            else df_all.iloc[0:0]
+        )
         if not df_k6.empty and "__GroupKey__" in df_k6.columns:
             for gkey, grp in df_k6.groupby("__GroupKey__"):
                 if side == "Bank":
@@ -910,17 +947,13 @@ def build_output_excel_bytes(bank_path: str, bokf_path: str) -> bytes:
                     for fid in grp.get("BokfRowID", pd.Series([], dtype=int)).tolist():
                         mapping[fid] = ("K6", gkey)
 
+    # 6) Kombinera + formatera till Excel → returnera bytes
     komb = build_combined_all(bank_all, bokf_all, mapping_bank, mapping_bokf)
 
-    # skriv till tempfil → formatera → returnera bytes
     with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td) / "output_avstamning.xlsx"
-        with pd.ExcelWriter(tmp, engine="openpyxl") as xw:
-            drop_ids(matched_bank_all).drop(columns=["__MatchKategori__","__GroupKey__"], errors="ignore").to_excel(xw, index=False, sheet_name="Matchade_Bank")
-            drop_ids(matched_bokf_all).drop(columns=["__MatchKategori__","__GroupKey__"], errors="ignore").to_excel(xw, index=False, sheet_name="Matchade_Bokföring")
-            drop_ids(om_bank_all).to_excel(xw, index=False, sheet_name="Omatchade_Bank")
-            drop_ids(om_bokf_all).to_excel(xw, index=False, sheet_name="Omatchade_Bokföring")
+        tmp_path = Path(td) / "output_avstamning.xlsx"
+        with pd.ExcelWriter(tmp_path, engine="openpyxl") as xw:
             komb.to_excel(xw, index=False, sheet_name="Kombinerad", startrow=3)
-        make_combined_sheet(tmp)
-        return tmp.read_bytes()
+        make_combined_sheet(tmp_path)
+        return tmp_path.read_bytes()
 
