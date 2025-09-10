@@ -2,7 +2,7 @@ import streamlit as st
 from pathlib import Path
 import tempfile
 
-import avstamning_Rental as avm   # <-- byt namn om din fil heter annorlunda
+import avstamning_master_kombinerad as avm   # <-- byt namn om din fil heter annorlunda
 
 st.set_page_config(page_title="Avstämning", page_icon="📊", layout="centered")
 st.title("📊 Avstämning – K1…K6 med K5X")
