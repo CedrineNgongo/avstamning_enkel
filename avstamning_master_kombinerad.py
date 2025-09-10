@@ -1,10 +1,16 @@
+# -*- coding: utf-8 -*-
 # fil: avstamning_master.py
-# Master-pipeline: K1 → K2 → K3 → K4 → K5 → K6
-# - K5 (LB) enligt sex-stegsreglerna från dig.
-# - Kombinerad: ingen skyddning, filter på rad 4, tusentalsformat, datumformat,
-#   och fliken flyttas först i arbetsboken.
-# - Ny källa uppdaterad (Bank + Bokföring).
-# - Robust filtrering, dialoger, "Spara som…".
+# Master-pipeline: K1 → K2 → K3 → K4 → K5 (LB) → K5X (global balans) → K6 (symmetrisk)
+# - Varje träff stämplas med __GroupKey__ = <KAT>-B<min BankRowID>-<löpnummer>
+# - Kombinerad bygger MatchGruppID ENBART från __GroupKey__ (ingen datumgissning).
+# - K5X (NY + utbyggd): Global balans innan K6 – kan nu ta bort på BOKF-sidan (Steg 1/2)
+#   OCH på BANK-sidan (Steg 1B/2B) för att hantera fall som –2 218,71-exemplet.
+# - “Ny källa”:
+#     Bank: Match / Kundreskontra (BG53782751...) / Leverantörsreskontra (LB...) / Manuell
+#     Bokföring: Match annars originalvärde i kolumn "Källa"
+# - Kombinerad först i arbetsboken, filter på rad 4, format:
+#     C2, E2, G2, N2 + kolumn N: "#,##0.00"; kolumn K: "yyyy-mm-dd"
+# - Dialoger: "Välj kontoutdraget" och "Välj bokföringslistan". "Spara som" alltid.
 
 import re
 import math
@@ -123,7 +129,7 @@ def load_bokf(path: str) -> pd.DataFrame:
         if col not in df.columns:
             raise ValueError(f"Bokföringsfilen saknar kolumnen: '{col}'")
     df = _strip_df(df)
-    # Släng allt där IB Året SEK inte är helt tomt
+    # Ta bort allt där IB Året SEK inte är helt tomt
     df = df[df["IB Året SEK"].isna() | (df["IB Året SEK"] == "")].copy()
     df["Datum"] = pd.to_datetime(df["Datum"], errors="coerce")
     df["Period SEK"] = _to_float(df["Period SEK"])
@@ -140,7 +146,6 @@ def has_yymmdd_in_text1(t, y): return isinstance(t,str) and ("Skabank" in t) and
 def has_yymmdd_in_vnr(v, y):   return isinstance(v,str) and ("Skabank" in v) and (y in v)
 def is_6digit_vnr(v):          return isinstance(v,str) and len(v)==6 and v.isdigit()
 
-# Säkert kolumn-anrop (om kolumn saknas i ett delurval → False)
 def col_apply(df: pd.DataFrame, col: str, func) -> pd.Series:
     if col in df.columns:
         return df[col].apply(func)
@@ -154,8 +159,27 @@ def combinations_limited(idx_list, max_combo=2000):
             if total > max_combo: return
             yield combo
 
+# ====================== Gruppnyckel (GroupKey) ======================
+def new_group_key(cat: str, bank_rows: pd.DataFrame, counters: dict) -> str:
+    counters.setdefault(cat, 0)
+    counters[cat] += 1
+    try:
+        min_bid = int(pd.to_numeric(bank_rows["BankRowID"]).min())
+    except Exception:
+        min_bid = 0
+    return f"{cat}-B{min_bid}-{counters[cat]:06d}"
+
+def stamp_match(bank_rows: pd.DataFrame, bokf_rows: pd.DataFrame, cat: str, counters: dict):
+    gkey = new_group_key(cat, bank_rows, counters)
+    b = bank_rows.copy()
+    f = bokf_rows.copy() if bokf_rows is not None else bokf_rows
+    b["__MatchKategori__"] = cat; b["__GroupKey__"] = gkey
+    if f is not None and not f.empty:
+        f["__MatchKategori__"] = cat; f["__GroupKey__"] = gkey
+    return b, f, gkey
+
 # =============================== K1 ===================================
-def run_category1_BG53782751(bank_df, bokf_df):
+def run_category1_BG53782751(bank_df, bokf_df, counters):
     bank_k1 = bank_df[
         bank_df["Text"].astype(str).str.contains(r"BG53782751", case=False, na=False)
         & (bank_df["Belopp"] > 0)
@@ -176,11 +200,11 @@ def run_category1_BG53782751(bank_df, bokf_df):
         if bokf_day.empty: continue
         try_match = lambda df_now: math.isclose(sum_sek(df_now["Period SEK"]), bank_sum, abs_tol=0.005)
 
-        # 1 totalsumma?
         cur = bokf_day.copy()
         if try_match(cur):
-            matched_bank_all.append(bank_day_rows); matched_bokf_all.append(cur); used_bokf_ids |= set(cur["BokfRowID"]); continue
-        # 2 ta bort EN = diff
+            b,f,_ = stamp_match(bank_day_rows, cur, "K1", counters)
+            matched_bank_all.append(b); matched_bokf_all.append(f); used_bokf_ids |= set(cur["BokfRowID"]); continue
+
         cur = bokf_day.copy()
         diff = sek_round(sum_sek(cur["Period SEK"]) - bank_sum)
         if diff != 0:
@@ -188,12 +212,14 @@ def run_category1_BG53782751(bank_df, bokf_df):
             if not cand.empty:
                 cur2 = cur[cur["BokfRowID"] != cand.iloc[0]["BokfRowID"]]
                 if try_match(cur2):
-                    matched_bank_all.append(bank_day_rows); matched_bokf_all.append(cur2); used_bokf_ids |= set(cur2["BokfRowID"]); continue
-        # 3 endast SEB
+                    b,f,_ = stamp_match(bank_day_rows, cur2, "K1", counters)
+                    matched_bank_all.append(b); matched_bokf_all.append(f); used_bokf_ids |= set(cur2["BokfRowID"]); continue
+
         cur = bokf_day[col_apply(bokf_day, "Verifikationsnummer", startswith_seb)].copy()
         if not cur.empty and try_match(cur):
-            matched_bank_all.append(bank_day_rows); matched_bokf_all.append(cur); used_bokf_ids |= set(cur["BokfRowID"]); continue
-        # 4 endast SEB + ta bort EN = diff
+            b,f,_ = stamp_match(bank_day_rows, cur, "K1", counters)
+            matched_bank_all.append(b); matched_bokf_all.append(f); used_bokf_ids |= set(cur["BokfRowID"]); continue
+
         cur = bokf_day[col_apply(bokf_day, "Verifikationsnummer", startswith_seb)].copy()
         if not cur.empty:
             diff = sek_round(sum_sek(cur["Period SEK"]) - bank_sum)
@@ -202,8 +228,9 @@ def run_category1_BG53782751(bank_df, bokf_df):
                 if not cand.empty:
                     cur2 = cur[cur["BokfRowID"] != cand.iloc[0]["BokfRowID"]]
                     if try_match(cur2):
-                        matched_bank_all.append(bank_day_rows); matched_bokf_all.append(cur2); used_bokf_ids |= set(cur2["BokfRowID"]); continue
-        # 5 kombination icke-SEB
+                        b,f,_ = stamp_match(bank_day_rows, cur2, "K1", counters)
+                        matched_bank_all.append(b); matched_bokf_all.append(f); used_bokf_ids |= set(cur2["BokfRowID"]); continue
+
         cur = bokf_day.copy()
         non_seb = cur[~col_apply(cur, "Verifikationsnummer", startswith_seb)]
         if not non_seb.empty:
@@ -214,17 +241,19 @@ def run_category1_BG53782751(bank_df, bokf_df):
                 if new_sum < target - 0.005 or new_sum > target + 0.005: continue
                 cur2 = cur.drop(index=list(combo))
                 if try_match(cur2):
-                    matched_bank_all.append(bank_day_rows); matched_bokf_all.append(cur2); used_bokf_ids |= set(cur2["BokfRowID"]); found = True; break
+                    b,f,_ = stamp_match(bank_day_rows, cur2, "K1", counters)
+                    matched_bank_all.append(b); matched_bokf_all.append(f); used_bokf_ids |= set(cur2["BokfRowID"]); found = True; break
             if found: continue
-        # 6 icke-SEB rätt YYMMDD i vnr + SEB
+
         cur_all = bokf_day.copy()
         nonseb = ~col_apply(cur_all, "Verifikationsnummer", startswith_seb)
         right = col_apply(cur_all, "Verifikationsnummer", lambda v: has_yymmdd_in_vnr(v, yymmdd))
         non_seb_right = cur_all[nonseb & right]
         cur = pd.concat([cur_all[col_apply(cur_all, "Verifikationsnummer", startswith_seb)], non_seb_right])
         if not cur.empty and try_match(cur):
-            matched_bank_all.append(bank_day_rows); matched_bokf_all.append(cur); used_bokf_ids |= set(cur["BokfRowID"]); continue
-        # 7 rätt YYMMDD + ta bort EN = diff
+            b,f,_ = stamp_match(bank_day_rows, cur, "K1", counters)
+            matched_bank_all.append(b); matched_bokf_all.append(f); used_bokf_ids |= set(cur["BokfRowID"]); continue
+
         if not cur.empty:
             diff = sek_round(sum_sek(cur["Period SEK"]) - bank_sum)
             if diff != 0:
@@ -232,8 +261,9 @@ def run_category1_BG53782751(bank_df, bokf_df):
                 if not cand.empty:
                     cur2 = cur[cur["BokfRowID"] != cand.iloc[0]["BokfRowID"]]
                     if try_match(cur2):
-                        matched_bank_all.append(bank_day_rows); matched_bokf_all.append(cur2); used_bokf_ids |= set(cur2["BokfRowID"]); continue
-        # 8 rätt YYMMDD + kombination icke-SEB
+                        b,f,_ = stamp_match(bank_day_rows, cur2, "K1", counters)
+                        matched_bank_all.append(b); matched_bokf_all.append(f); used_bokf_ids |= set(cur2["BokfRowID"]); continue
+
         if not cur.empty:
             non_seb2 = cur[~col_apply(cur, "Verifikationsnummer", startswith_seb)]
             base_sum = sum_sek(cur["Period SEK"]); target = bank_sum; found = False
@@ -243,7 +273,8 @@ def run_category1_BG53782751(bank_df, bokf_df):
                 if new_sum < target - 0.005 or new_sum > target + 0.005: continue
                 cur2 = cur.drop(index=list(combo))
                 if try_match(cur2):
-                    matched_bank_all.append(bank_day_rows); matched_bokf_all.append(cur2); used_bokf_ids |= set(cur2["BokfRowID"]); found = True; break
+                    b,f,_ = stamp_match(bank_day_rows, cur2, "K1", counters)
+                    matched_bank_all.append(b); matched_bokf_all.append(f); used_bokf_ids |= set(cur2["BokfRowID"]); found = True; break
             if found: continue
 
     matched_bank = pd.concat(matched_bank_all, ignore_index=True) if matched_bank_all else bank_k1.iloc[0:0].copy()
@@ -251,7 +282,7 @@ def run_category1_BG53782751(bank_df, bokf_df):
     return matched_bank, matched_bokf
 
 # =============================== K2 ===================================
-def run_category2_BG5341_7689(bank_df, bokf_df):
+def run_category2_BG5341_7689(bank_df, bokf_df, counters):
     bank_k2 = bank_df[
         bank_df["Text"].astype(str).str.contains(r"BG\s*5341-7689", case=False, na=False)
         & (bank_df["Belopp"] > 0)
@@ -302,18 +333,19 @@ def run_category2_BG5341_7689(bank_df, bokf_df):
 
         try_match = lambda df_now: math.isclose(sum_sek(df_now["Period SEK"]), bank_sum, abs_tol=0.005)
 
-        # 1
         cur = bokf_065()
         if not cur.empty and try_match(cur):
-            matched_bank_all.append(bank_day_rows); matched_bokf_all.append(cur); used_bokf_ids |= set(cur["BokfRowID"]); continue
-        # 2
+            b,f,_ = stamp_match(bank_day_rows, cur, "K2", counters)
+            matched_bank_all.append(b); matched_bokf_all.append(f); used_bokf_ids |= set(cur["BokfRowID"]); continue
+
         cur = bokf_065()
         if not cur.empty:
             cand = cur[cur["Period SEK"].round(2) == bank_sum]
             if not cand.empty:
                 chosen = cand.iloc[[0]]
-                matched_bank_all.append(bank_day_rows); matched_bokf_all.append(chosen); used_bokf_ids |= set(chosen["BokfRowID"]); continue
-        # 3
+                b,f,_ = stamp_match(bank_day_rows, chosen, "K2", counters)
+                matched_bank_all.append(b); matched_bokf_all.append(f); used_bokf_ids |= set(chosen["BokfRowID"]); continue
+
         cur = bokf_065()
         if not cur.empty:
             diff = sek_round(sum_sek(cur["Period SEK"]) - bank_sum)
@@ -322,17 +354,22 @@ def run_category2_BG5341_7689(bank_df, bokf_df):
                 if not drop.empty:
                     cur2 = cur[cur["BokfRowID"] != drop.iloc[0]["BokfRowID"]]
                     if try_match(cur2):
-                        matched_bank_all.append(bank_day_rows); matched_bokf_all.append(cur2); used_bokf_ids |= set(cur2["BokfRowID"]); continue
-        # 4–7 (Text1 med rätt YYMMDD)
+                        b,f,_ = stamp_match(bank_day_rows, cur2, "K2", counters)
+                        matched_bank_all.append(b); matched_bokf_all.append(f); used_bokf_ids |= set(cur2["BokfRowID"]); continue
+
         cur = only_text1_rightYY(bokf_065())
         if not cur.empty and try_match(cur):
-            matched_bank_all.append(bank_day_rows); matched_bokf_all.append(cur); used_bokf_ids |= set(cur["BokfRowID"]); continue
+            b,f,_ = stamp_match(bank_day_rows, cur, "K2", counters)
+            matched_bank_all.append(b); matched_bokf_all.append(f); used_bokf_ids |= set(cur["BokfRowID"]); continue
+
         cur = only_text1_rightYY(bokf_065())
         if not cur.empty:
             cand = cur[cur["Period SEK"].round(2) == bank_sum]
             if not cand.empty:
                 chosen = cand.iloc[[0]]
-                matched_bank_all.append(bank_day_rows); matched_bokf_all.append(chosen); used_bokf_ids |= set(chosen["BokfRowID"]); continue
+                b,f,_ = stamp_match(bank_day_rows, chosen, "K2", counters)
+                matched_bank_all.append(b); matched_bokf_all.append(f); used_bokf_ids |= set(chosen["BokfRowID"]); continue
+
         cur = only_text1_rightYY(bokf_065())
         if not cur.empty:
             diff = sek_round(sum_sek(cur["Period SEK"]) - bank_sum)
@@ -341,7 +378,9 @@ def run_category2_BG5341_7689(bank_df, bokf_df):
                 if not drop.empty:
                     cur2 = cur[cur["BokfRowID"] != drop.iloc[0]["BokfRowID"]]
                     if try_match(cur2):
-                        matched_bank_all.append(bank_day_rows); matched_bokf_all.append(cur2); used_bokf_ids |= set(cur2["BokfRowID"]); continue
+                        b,f,_ = stamp_match(bank_day_rows, cur2, "K2", counters)
+                        matched_bank_all.append(b); matched_bokf_all.append(f); used_bokf_ids |= set(cur2["BokfRowID"]); continue
+
         cur = only_text1_rightYY(bokf_065())
         if not cur.empty:
             base_sum = sum_sek(cur["Period SEK"]); target = bank_sum; found = False
@@ -352,20 +391,25 @@ def run_category2_BG5341_7689(bank_df, bokf_df):
                     if new_sum < target - 0.005 or new_sum > target + 0.005: continue
                     cur2 = cur.drop(index=list(combo))
                     if try_match(cur2):
-                        matched_bank_all.append(bank_day_rows); matched_bokf_all.append(cur2); used_bokf_ids |= set(cur2["BokfRowID"]); found = True; break
+                        b,f,_ = stamp_match(bank_day_rows, cur2, "K2", counters)
+                        matched_bank_all.append(b); matched_bokf_all.append(f); used_bokf_ids |= set(cur2["BokfRowID"]); found = True; break
                 if found: break
             if found: continue
-        # 8–11 (065 + Inbetalningar icke-SEB rätt YY)
+
         set_065 = only_text1_rightYY(bokf_065())
         set_inb = bokf_inbet_noSEB_rightYY()
         cur = pd.concat([set_065, set_inb], ignore_index=False)
         if not cur.empty and try_match(cur):
-            matched_bank_all.append(bank_day_rows); matched_bokf_all.append(cur); used_bokf_ids |= set(cur["BokfRowID"]); continue
+            b,f,_ = stamp_match(bank_day_rows, cur, "K2", counters)
+            matched_bank_all.append(b); matched_bokf_all.append(f); used_bokf_ids |= set(cur["BokfRowID"]); continue
+
         if not cur.empty:
             cand = cur[cur["Period SEK"].round(2) == bank_sum]
             if not cand.empty:
                 chosen = cand.iloc[[0]]
-                matched_bank_all.append(bank_day_rows); matched_bokf_all.append(chosen); used_bokf_ids |= set(chosen["BokfRowID"]); continue
+                b,f,_ = stamp_match(bank_day_rows, chosen, "K2", counters)
+                matched_bank_all.append(b); matched_bokf_all.append(f); used_bokf_ids |= set(chosen["BokfRowID"]); continue
+
         if not cur.empty:
             diff = sek_round(sum_sek(cur["Period SEK"]) - bank_sum)
             if diff != 0:
@@ -373,7 +417,9 @@ def run_category2_BG5341_7689(bank_df, bokf_df):
                 if not drop.empty:
                     cur2 = cur[cur["BokfRowID"] != drop.iloc[0]["BokfRowID"]]
                     if try_match(cur2):
-                        matched_bank_all.append(bank_day_rows); matched_bokf_all.append(cur2); used_bokf_ids |= set(cur2["BokfRowID"]); continue
+                        b,f,_ = stamp_match(bank_day_rows, cur2, "K2", counters)
+                        matched_bank_all.append(b); matched_bokf_all.append(f); used_bokf_ids |= set(cur2["BokfRowID"]); continue
+
         if not cur.empty:
             base_sum = sum_sek(cur["Period SEK"]); target = bank_sum; found = False
             for r in [1,2,3]:
@@ -383,19 +429,24 @@ def run_category2_BG5341_7689(bank_df, bokf_df):
                     if new_sum < target - 0.005 or new_sum > target + 0.005: continue
                     cur2 = cur.drop(index=list(combo))
                     if try_match(cur2):
-                        matched_bank_all.append(bank_day_rows); matched_bokf_all.append(cur2); used_bokf_ids |= set(cur2["BokfRowID"]); found = True; break
+                        b,f,_ = stamp_match(bank_day_rows, cur2, "K2", counters)
+                        matched_bank_all.append(b); matched_bokf_all.append(f); used_bokf_ids |= set(cur2["BokfRowID"]); found = True; break
                 if found: break
             if found: continue
-        # 12–15 (+ Betalningar ±2d, 6-siffrigt vnr med rätt YY)
+
         set_bet = bokf_betalningar_pm2_rightYY()
         cur = pd.concat([set_065, set_inb, set_bet], ignore_index=False)
         if not cur.empty and try_match(cur):
-            matched_bank_all.append(bank_day_rows); matched_bokf_all.append(cur); used_bokf_ids |= set(cur["BokfRowID"]); continue
+            b,f,_ = stamp_match(bank_day_rows, cur, "K2", counters)
+            matched_bank_all.append(b); matched_bokf_all.append(f); used_bokf_ids |= set(cur["BokfRowID"]); continue
+
         if not cur.empty:
             cand = cur[cur["Period SEK"].round(2) == bank_sum]
             if not cand.empty:
                 chosen = cand.iloc[[0]]
-                matched_bank_all.append(bank_day_rows); matched_bokf_all.append(chosen); used_bokf_ids |= set(chosen["BokfRowID"]); continue
+                b,f,_ = stamp_match(bank_day_rows, chosen, "K2", counters)
+                matched_bank_all.append(b); matched_bokf_all.append(f); used_bokf_ids |= set(chosen["BokfRowID"]); continue
+
         if not cur.empty:
             diff = sek_round(sum_sek(cur["Period SEK"]) - bank_sum)
             if diff != 0:
@@ -403,7 +454,9 @@ def run_category2_BG5341_7689(bank_df, bokf_df):
                 if not drop.empty:
                     cur2 = cur[cur["BokfRowID"] != drop.iloc[0]["BokfRowID"]]
                     if try_match(cur2):
-                        matched_bank_all.append(bank_day_rows); matched_bokf_all.append(cur2); used_bokf_ids |= set(cur2["BokfRowID"]); continue
+                        b,f,_ = stamp_match(bank_day_rows, cur2, "K2", counters)
+                        matched_bank_all.append(b); matched_bokf_all.append(f); used_bokf_ids |= set(cur2["BokfRowID"]); continue
+
         if not cur.empty:
             base_sum = sum_sek(cur["Period SEK"]); target = bank_sum; found = False
             for r in [1,2,3]:
@@ -413,7 +466,8 @@ def run_category2_BG5341_7689(bank_df, bokf_df):
                     if new_sum < target - 0.005 or new_sum > target + 0.005: continue
                     cur2 = cur.drop(index=list(combo))
                     if try_match(cur2):
-                        matched_bank_all.append(bank_day_rows); matched_bokf_all.append(cur2); used_bokf_ids |= set(cur2["BokfRowID"]); found = True; break
+                        b,f,_ = stamp_match(bank_day_rows, cur2, "K2", counters)
+                        matched_bank_all.append(b); matched_bokf_all.append(f); used_bokf_ids |= set(cur2["BokfRowID"]); found = True; break
                 if found: break
             if found: continue
 
@@ -422,7 +476,7 @@ def run_category2_BG5341_7689(bank_df, bokf_df):
     return matched_bank, matched_bokf
 
 # =============================== K3 ===================================
-def run_category3_35ref(bank_df, bokf_df):
+def run_category3_35ref(bank_df, bokf_df, counters):
     has_35ref = bank_df["Text"].astype(str).str.contains(r"35\d{10}", regex=True, na=False)
     bank_k3 = bank_df[has_35ref].copy().sort_values(["Bokföringsdatum","BankRowID"])
     bokf_pay = bokf_df[(bokf_df["Kategori"].astype(str).str.strip() == "Betalningar")].copy()
@@ -438,16 +492,17 @@ def run_category3_35ref(bank_df, bokf_df):
             (bokf_pay["Period SEK"].round(2) == amount)
         ].copy()
         if len(cand) >= 1:
-            chosen = cand.sort_values("BokfRowID").iloc[0]
-            used_bokf_ids.add(chosen["BokfRowID"])
-            matched_bank_rows.append(b); matched_bokf_rows.append(chosen)
+            chosen = cand.sort_values("BokfRowID").iloc[[0]]
+            used_bokf_ids |= set(chosen["BokfRowID"])
+            b2,f2,_ = stamp_match(pd.DataFrame([b]), chosen, "K3", counters)
+            matched_bank_rows.append(b2.iloc[0]); matched_bokf_rows.append(f2.iloc[0])
 
     matched_bank = pd.DataFrame(matched_bank_rows) if matched_bank_rows else bank_k3.iloc[0:0].copy()
     matched_bokf = pd.DataFrame(matched_bokf_rows) if matched_bokf_rows else bokf_df.iloc[0:0].copy()
     return matched_bank, matched_bokf
 
 # =============================== K4 ===================================
-def run_category4_ovrigt(bank_df, bokf_df):
+def run_category4_ovrigt(bank_df, bokf_df, counters):
     mask_k1 = bank_df["Text"].astype(str).str.contains(r"BG53782751", case=False, na=False)
     mask_k2 = bank_df["Text"].astype(str).str.contains(r"BG\s*5341-7689", case=False, na=False)
     mask_k3 = bank_df["Text"].astype(str).str.contains(r"35\d{10}", regex=True, na=False)
@@ -464,20 +519,18 @@ def run_category4_ovrigt(bank_df, bokf_df):
             (bokf_df["Period SEK"].round(2) == amount)
         ].copy()
         if len(cand) >= 1:
-            chosen = cand.sort_values("BokfRowID").iloc[0]
-            used_bokf_ids.add(chosen["BokfRowID"])
-            matched_bank_rows.append(b); matched_bokf_rows.append(chosen)
+            chosen = cand.sort_values("BokfRowID").iloc[[0]]
+            used_bokf_ids |= set(chosen["BokfRowID"])
+            b2,f2,_ = stamp_match(pd.DataFrame([b]), chosen, "K4", counters)
+            matched_bank_rows.append(b2.iloc[0]); matched_bokf_rows.append(f2.iloc[0])
 
     matched_bank = pd.DataFrame(matched_bank_rows) if matched_bank_rows else bank_k4.iloc[0:0].copy()
     matched_bokf = pd.DataFrame(matched_bokf_rows) if matched_bokf_rows else bokf_df.iloc[0:0].copy()
     return matched_bank, matched_bokf
 
 # =============================== K5 (LB – 6 steg) =====================
-def run_category5_LB(bank_df: pd.DataFrame, bokf_df: pd.DataFrame):
-    """
-    1) Alla bokf-rader (oavsett tecken): total==bank, annars 2) en rad==bank, 3) diff-rad bort
-    4) Endast negativa: total==bank, 5) en rad==bank, 6) diff-rad bort
-    """
+def run_category5_LB(bank_df: pd.DataFrame, bokf_df: pd.DataFrame, counters=None):
+    if counters is None: counters = {}
     bank_lb = bank_df[bank_df["Text"].astype(str).str.match(r"^\s*LB", case=False, na=False)].copy()
 
     matched_bank_all, matched_bokf_all = [], []
@@ -486,12 +539,12 @@ def run_category5_LB(bank_df: pd.DataFrame, bokf_df: pd.DataFrame):
     def try_match(df_now: pd.DataFrame, target_sum: float) -> bool:
         return math.isclose(sum_sek(df_now["Period SEK"]), target_sum, abs_tol=0.005)
 
-    for bank_date, bank_day_rows in bank_lb.groupby(bank_lb["Bokföringsdatum"].dt.date):
+    for _, bank_day_rows in bank_lb.groupby(bank_lb["Bokföringsdatum"].dt.date):
         bank_day_rows = bank_day_rows.sort_values("BankRowID")
         bank_sum = sum_sek(bank_day_rows["Belopp"])
 
         def get_bokf_rows(neg_only: bool) -> pd.DataFrame:
-            q = (bokf_df["Datum"].dt.date == bank_date) & (~bokf_df["BokfRowID"].isin(used_bokf_ids))
+            q = (bokf_df["Datum"].dt.date == bank_day_rows["Bokföringsdatum"].dt.date.iloc[0]) & (~bokf_df["BokfRowID"].isin(used_bokf_ids))
             if neg_only:
                 q = q & (bokf_df["Period SEK"] < 0)
             return bokf_df[q].copy()
@@ -500,11 +553,13 @@ def run_category5_LB(bank_df: pd.DataFrame, bokf_df: pd.DataFrame):
         bokf_all = get_bokf_rows(neg_only=False)
         if not bokf_all.empty:
             if try_match(bokf_all, bank_sum):
-                matched_bank_all.append(bank_day_rows); matched_bokf_all.append(bokf_all); used_bokf_ids |= set(bokf_all["BokfRowID"]); continue
+                b,f,_ = stamp_match(bank_day_rows, bokf_all, "K5", counters)
+                matched_bank_all.append(b); matched_bokf_all.append(f); used_bokf_ids |= set(bokf_all["BokfRowID"]); continue
             cand = bokf_all[bokf_all["Period SEK"].round(2) == bank_sum]
             if len(cand) >= 1:
                 chosen = cand.sort_values("BokfRowID").iloc[[0]]
-                matched_bank_all.append(bank_day_rows); matched_bokf_all.append(chosen); used_bokf_ids |= set(chosen["BokfRowID"]); continue
+                b,f,_ = stamp_match(bank_day_rows, chosen, "K5", counters)
+                matched_bank_all.append(b); matched_bokf_all.append(f); used_bokf_ids |= set(chosen["BokfRowID"]); continue
             diff = sek_round(sum_sek(bokf_all["Period SEK"]) - bank_sum)
             if diff != 0:
                 drop = bokf_all[bokf_all["Period SEK"].round(2) == diff]
@@ -512,32 +567,206 @@ def run_category5_LB(bank_df: pd.DataFrame, bokf_df: pd.DataFrame):
                     drop_id = drop.sort_values("BokfRowID").iloc[0]["BokfRowID"]
                     remainder = bokf_all[bokf_all["BokfRowID"] != drop_id]
                     if try_match(remainder, bank_sum):
-                        matched_bank_all.append(bank_day_rows); matched_bokf_all.append(remainder); used_bokf_ids |= set(remainder["BokfRowID"]); continue
+                        b,f,_ = stamp_match(bank_day_rows, remainder, "K5", counters)
+                        matched_bank_all.append(b); matched_bokf_all.append(f); used_bokf_ids |= set(remainder["BokfRowID"]); continue
 
         # 4–6: endast negativa
         bokf_neg = get_bokf_rows(neg_only=True)
-        if bokf_neg.empty: continue
-        if try_match(bokf_neg, bank_sum):
-            matched_bank_all.append(bank_day_rows); matched_bokf_all.append(bokf_neg); used_bokf_ids |= set(bokf_neg["BokfRowID"]); continue
-        cand = bokf_neg[bokf_neg["Period SEK"].round(2) == bank_sum]
-        if len(cand) >= 1:
-            chosen = cand.sort_values("BokfRowID").iloc[[0]]
-            matched_bank_all.append(bank_day_rows); matched_bokf_all.append(chosen); used_bokf_ids |= set(chosen["BokfRowID"]); continue
-        diff = sek_round(sum_sek(bokf_neg["Period SEK"]) - bank_sum)
-        if diff != 0:
-            drop = bokf_neg[bokf_neg["Period SEK"].round(2) == diff]
-            if len(drop) >= 1:
-                drop_id = drop.sort_values("BokfRowID").iloc[0]["BokfRowID"]
-                remainder = bokf_neg[bokf_neg["BokfRowID"] != drop_id]
-                if try_match(remainder, bank_sum):
-                    matched_bank_all.append(bank_day_rows); matched_bokf_all.append(remainder); used_bokf_ids |= set(remainder["BokfRowID"]); continue
+        if not bokf_neg.empty:
+            if try_match(bokf_neg, bank_sum):
+                b,f,_ = stamp_match(bank_day_rows, bokf_neg, "K5", counters)
+                matched_bank_all.append(b); matched_bokf_all.append(f); used_bokf_ids |= set(bokf_neg["BokfRowID"]); continue
+            cand = bokf_neg[bokf_neg["Period SEK"].round(2) == bank_sum]
+            if len(cand) >= 1:
+                chosen = cand.sort_values("BokfRowID").iloc[[0]]
+                b,f,_ = stamp_match(bank_day_rows, chosen, "K5", counters)
+                matched_bank_all.append(b); matched_bokf_all.append(f); used_bokf_ids |= set(chosen["BokfRowID"]); continue
+            diff = sek_round(sum_sek(bokf_neg["Period SEK"]) - bank_sum)
+            if diff != 0:
+                drop = bokf_neg[bokf_neg["Period SEK"].round(2) == diff]
+                if len(drop) >= 1:
+                    drop_id = drop.sort_values("BokfRowID").iloc[0]["BokfRowID"]
+                    remainder = bokf_neg[bokf_neg["BokfRowID"] != drop_id]
+                    if try_match(remainder, bank_sum):
+                        b,f,_ = stamp_match(bank_day_rows, remainder, "K5", counters)
+                        matched_bank_all.append(b); matched_bokf_all.append(f); used_bokf_ids |= set(remainder["BokfRowID"]); continue
 
     matched_bank = pd.concat(matched_bank_all, ignore_index=True) if matched_bank_all else bank_lb.iloc[0:0].copy()
     matched_bokf = pd.concat(matched_bokf_all, ignore_index=True) if matched_bokf_all else bokf_df.iloc[0:0].copy()
     return matched_bank, matched_bokf
 
+# ========================== K5X (NY – Global balans, utbyggd) ==========================
+def subset_sum_mitm(values_cents, ids, target_cents, max_rows=50):
+    """
+    Meet-in-the-middle:
+      - Om n ≤ 26: full MITM (två halvor fullständigt).
+      - Om 27–50: använd topp 34 med störst |belopp| (17+17) för MITM.
+      - Returnerar set(ids) som ska EXKLUDERAS för att "resten" ska bli target.
+    """
+    n = len(values_cents)
+    if n == 0:
+        return None
+    # Välj de max_rows största i absolutbelopp
+    order = sorted(range(n), key=lambda i: abs(values_cents[i]), reverse=True)[:min(n, max_rows)]
+    values_cents = [values_cents[i] for i in order]
+    ids = [ids[i] for i in order]
+    n = len(values_cents)
+
+    # Om total redan == target → returnera tom mängd (exclude none)
+    if sum(values_cents) == target_cents:
+        return set()
+
+    if n <= 26:
+        k = n // 2
+        left_vals, left_ids = values_cents[:k], ids[:k]
+        right_vals, right_ids = values_cents[k:], ids[k:]
+
+        left_sums = {0: set()}
+        for v, i in zip(left_vals, left_ids):
+            new = {}
+            for s, comb in left_sums.items():
+                ns = s + v
+                if ns not in left_sums and ns not in new:
+                    new[ns] = comb | {i}
+            left_sums.update(new)
+
+        right_sums = {0: set()}
+        for v, i in zip(right_vals, right_ids):
+            new = {}
+            for s, comb in right_sums.items():
+                ns = s + v
+                if ns not in right_sums and ns not in new:
+                    new[ns] = comb | {i}
+            right_sums.update(new)
+
+        for sL, combL in left_sums.items():
+            need = target_cents - sL
+            if need in right_sums:
+                return combL | right_sums[need]
+        return None
+    else:
+        # 27–50 → ta topp 34 (17+17) för kontrollerbar MITM
+        take = min(34, n)
+        left_vals, left_ids = values_cents[:17], ids[:17]
+        right_vals, right_ids = values_cents[17:take], ids[17:take]
+
+        left_sums = {0: set()}
+        for v, i in zip(left_vals, left_ids):
+            new = {}
+            for s, comb in left_sums.items():
+                ns = s + v
+                if ns not in left_sums and ns not in new:
+                    new[ns] = comb | {i}
+            left_sums.update(new)
+
+        right_sums = {0: set()}
+        for v, i in zip(right_vals, right_ids):
+            new = {}
+            for s, comb in right_sums.items():
+                ns = s + v
+                if ns not in right_sums and ns not in new:
+                    new[ns] = comb | {i}
+            right_sums.update(new)
+
+        for sL, combL in left_sums.items():
+            need = target_cents - sL
+            if need in right_sums:
+                return combL | right_sums[need]
+        return None
+
+def run_category5X_global(bank_df: pd.DataFrame, bokf_df: pd.DataFrame, counters=None):
+    """
+    K5X PER DATUM (symmetrisk):
+      - Bankurval: Alla återstående bankrader för dagen
+      - Bokföringsurval: Alla återstående bokföringsrader för dagen
+      Steg 1  (BOKF): EN bokf-rad == diff -> ta bort den, matcha resten
+      Steg 2  (BOKF): MITM(bokf) == diff  -> ta bort dem, matcha resten
+      Steg 1B (BANK): EN bankrad == -diff -> ta bort den, matcha resten
+      Steg 2B (BANK): MITM(bank) == -diff -> ta bort dem, matcha resten
+    """
+    if counters is None: counters = {}
+    if bank_df.empty or bokf_df.empty:
+        return bank_df.iloc[0:0].copy(), bokf_df.iloc[0:0].copy()
+
+    matched_bank_all, matched_bokf_all = [], []
+
+    # Samla alla datum som finns kvar på någon sida
+    bank_dates = set(bank_df.dropna(subset=["Bokföringsdatum"])["Bokföringsdatum"].dt.date)
+    bokf_dates = set(bokf_df.dropna(subset=["Datum"])["Datum"].dt.date)
+    all_dates = sorted(bank_dates | bokf_dates)
+
+    for d in all_dates:
+        b_day = bank_df[bank_df["Bokföringsdatum"].dt.date == d].copy()
+        f_day = bokf_df[bokf_df["Datum"].dt.date == d].copy()
+        if b_day.empty or f_day.empty:
+            continue
+
+        bank_sum = sum_sek(b_day["Belopp"])
+        bokf_sum = sum_sek(f_day["Period SEK"])
+        diff = sek_round(bokf_sum - bank_sum)
+
+        # ---- Steg 1 (BOKF: singel == diff)
+        one = f_day[f_day["Period SEK"].round(2) == diff]
+        if not one.empty:
+            drop_id = one.sort_values("BokfRowID").iloc[0]["BokfRowID"]
+            remainder_f = f_day[f_day["BokfRowID"] != drop_id]
+            if math.isclose(sum_sek(remainder_f["Period SEK"]), bank_sum, abs_tol=0.005):
+                b,f,_ = stamp_match(b_day, remainder_f, "K5X", counters)
+                matched_bank_all.append(b); matched_bokf_all.append(f)
+                # ta bort dagens träffade rader från fortsatta försök
+                bank_df = bank_df[~bank_df["BankRowID"].isin(b["BankRowID"])]
+                bokf_df = bokf_df[~bokf_df["BokfRowID"].isin(f["BokfRowID"])]
+                continue
+
+        # ---- Steg 2 (BOKF: MITM == diff)
+        vals = f_day["Period SEK"].fillna(0).round(2).tolist()
+        ids  = f_day["BokfRowID"].tolist()
+        cents = [int(round(v*100)) for v in vals]
+        target_cents = int(round(diff*100))
+        exclude = subset_sum_mitm(cents, ids, target_cents, max_rows=50)
+        if exclude is not None:
+            remainder_f = f_day[~f_day["BokfRowID"].isin(exclude)]
+            if math.isclose(sum_sek(remainder_f["Period SEK"]), bank_sum, abs_tol=0.005):
+                b,f,_ = stamp_match(b_day, remainder_f, "K5X", counters)
+                matched_bank_all.append(b); matched_bokf_all.append(f)
+                bank_df = bank_df[~bank_df["BankRowID"].isin(b["BankRowID"])]
+                bokf_df = bokf_df[~bokf_df["BokfRowID"].isin(f["BokfRowID"])]
+                continue
+
+        # ---- Steg 1B (BANK: singel == -diff)
+        one_bank = b_day[b_day["Belopp"].round(2) == -diff]
+        if not one_bank.empty:
+            drop_bid = one_bank.sort_values("BankRowID").iloc[0]["BankRowID"]
+            remainder_b = b_day[b_day["BankRowID"] != drop_bid]
+            if math.isclose(sum_sek(f_day["Period SEK"]), sum_sek(remainder_b["Belopp"]), abs_tol=0.005):
+                b,f,_ = stamp_match(remainder_b, f_day, "K5X", counters)
+                matched_bank_all.append(b); matched_bokf_all.append(f)
+                bank_df = bank_df[~bank_df["BankRowID"].isin(b["BankRowID"])]
+                bokf_df = bokf_df[~bokf_df["BokfRowID"].isin(f["BokfRowID"])]
+                continue
+
+        # ---- Steg 2B (BANK: MITM == -diff)
+        vals_b = b_day["Belopp"].fillna(0).round(2).tolist()
+        ids_b  = b_day["BankRowID"].tolist()
+        cents_b = [int(round(v*100)) for v in vals_b]
+        target_b_cents = int(round(-diff*100))  # OBS: -diff
+        exclude_b = subset_sum_mitm(cents_b, ids_b, target_b_cents, max_rows=50)
+        if exclude_b is not None:
+            remainder_b = b_day[~b_day["BankRowID"].isin(exclude_b)]
+            if math.isclose(sum_sek(f_day["Period SEK"]), sum_sek(remainder_b["Belopp"]), abs_tol=0.005):
+                b,f,_ = stamp_match(remainder_b, f_day, "K5X", counters)
+                matched_bank_all.append(b); matched_bokf_all.append(f)
+                bank_df = bank_df[~bank_df["BankRowID"].isin(b["BankRowID"])]
+                bokf_df = bokf_df[~bokf_df["BokfRowID"].isin(f["BokfRowID"])]
+                continue
+
+    matched_bank = pd.concat(matched_bank_all, ignore_index=True) if matched_bank_all else bank_df.iloc[0:0].copy()
+    matched_bokf = pd.concat(matched_bokf_all, ignore_index=True) if matched_bokf_all else bokf_df.iloc[0:0].copy()
+    return matched_bank, matched_bokf
+
+
 # =============================== K6 (symmetrisk) ======================
-def run_category6_symmetric(bank_df, bokf_df):
+def run_category6_symmetric(bank_df, bokf_df, counters):
     if bank_df.empty and bokf_df.empty:
         return bank_df.iloc[0:0].copy(), bokf_df.iloc[0:0].copy()
 
@@ -588,21 +817,24 @@ def run_category6_symmetric(bank_df, bokf_df):
     matched_dates |= set().union(*[g["dates"] for g in combo_groups]) if combo_groups else set()
 
     matched_bank, matched_bokf = [], []
+
     single_dates = sorted(d for d in totals if d in matched_dates and all(d not in g["dates"] for g in combo_groups))
     for d in single_dates:
-        group_key = f"K6-D-{extract_yymmdd(pd.to_datetime(d))}"
         b_rows = bank_df[bank_df["Bokföringsdatum"].dt.date == d].copy()
         f_rows = bokf_df[bokf_df["Datum"].dt.date == d].copy()
-        if not b_rows.empty: b_rows["__MatchKategori__"] = "K6"; b_rows["__GroupKey__"] = group_key; matched_bank.append(b_rows)
-        if not f_rows.empty: f_rows["__MatchKategori__"] = "K6"; f_rows["__GroupKey__"] = group_key; matched_bokf.append(f_rows)
+        if b_rows.empty and f_rows.empty: continue
+        b2,f2,_ = stamp_match(b_rows, f_rows, "K6", counters)
+        if not b2.empty: matched_bank.append(b2)
+        if not f2.empty: matched_bokf.append(f2)
 
-    for i, g in enumerate(combo_groups, start=1):
-        group_key = f"K6-G-{i:06d}"
+    for _, g in enumerate(combo_groups, start=1):
         dset = g["dates"]
         b_rows = bank_df[bank_df["Bokföringsdatum"].dt.date.isin(dset)].copy()
         f_rows = bokf_df[bokf_df["Datum"].dt.date.isin(dset)].copy()
-        if not b_rows.empty: b_rows["__MatchKategori__"] = "K6"; b_rows["__GroupKey__"] = group_key; matched_bank.append(b_rows)
-        if not f_rows.empty: f_rows["__MatchKategori__"] = "K6"; f_rows["__GroupKey__"] = group_key; matched_bokf.append(f_rows)
+        if b_rows.empty and f_rows.empty: continue
+        b2,f2,_ = stamp_match(b_rows, f_rows, "K6", counters)
+        if not b2.empty: matched_bank.append(b2)
+        if not f2.empty: matched_bokf.append(f2)
 
     matched_bank = pd.concat(matched_bank, ignore_index=True) if matched_bank else bank_df.iloc[0:0].copy()
     matched_bokf = pd.concat(matched_bokf, ignore_index=True) if matched_bokf else bokf_df.iloc[0:0].copy()
@@ -615,7 +847,6 @@ def build_combined_all(bank_all, bokf_all, mapping_bank, mapping_bokf):
         is_matched = r["BankRowID"] in mapping_bank
         cat, gid = mapping_bank.get(r["BankRowID"], ("",""))
         text = str(r.get("Text","") or "")
-        # Ny källa (Bank)
         if is_matched:
             ny_kalla = "Match"
         elif re.match(r"^\s*BG53782751", text, flags=re.IGNORECASE):
@@ -700,45 +931,48 @@ def make_combined_sheet(wb_path: Path):
     fill("G2", bg_hex="#D9D9D9"); ws["G2"] = "=E2-C2"; ws["G2"].number_format = "#,##0.00"
     fill("N2", bg_hex="#D9D9D9"); ws["N2"] = "=ROUND(SUBTOTAL(9,N5:N99999),2)"; ws["N2"].number_format = "#,##0.00"
 
-    # Frys rubriker (rad 4)
     ws.freeze_panes = "A5"
 
-    # Kolumnbredder
     for col_idx in range(1, ws.max_column + 1):
         ws.column_dimensions[get_column_letter(col_idx)].width = 14
 
-    # Nummerformat i kolumn N (Period SEK) från rad 5 och nedåt
     col_N = 14  # N
     for r in range(5, ws.max_row + 1):
         ws.cell(row=r, column=col_N).number_format = "#,##0.00"
 
-    # Datumformat i kolumn K (YYYY-MM-DD) från rad 5 och nedåt
     col_K = 11  # K
     for r in range(5, ws.max_row + 1):
         ws.cell(row=r, column=col_K).number_format = "yyyy-mm-dd"
 
-    # Filter-knappar på rubrikraden (rad 4)
     last_col_letter = get_column_letter(ws.max_column)
     if ws.max_row >= 4:
         ws.auto_filter.ref = f"A4:{last_col_letter}{ws.max_row}"
 
-    # Flytta "Kombinerad" först i arbetsboken
     try:
         sheets = wb._sheets
         idx = sheets.index(ws)
         sheets.insert(0, sheets.pop(idx))
     except Exception:
-        pass  # om något skulle strula, låt ordningen vara
+        pass
 
     wb.save(wb_path)
 
 # =============================== Export/Helpers ===============================
-def drop_ids(df: pd.DataFrame) -> pd.DataFrame:
-    return df.drop(columns=["BankRowID","BokfRowID"], errors="ignore")
-
-def df_by_cat(df: pd.DataFrame, cat: str) -> pd.DataFrame:
-    if df.empty or "__MatchKategori__" not in df.columns: return df.iloc[0:0].copy()
-    return df[df["__MatchKategori__"] == cat].copy()
+def build_mapping_from_groupkey(matched_bank_all: pd.DataFrame, matched_bokf_all: pd.DataFrame):
+    mapping_bank, mapping_bokf = {}, {}
+    if not matched_bank_all.empty and "__GroupKey__" in matched_bank_all.columns:
+        for gkey, grp in matched_bank_all.groupby("__GroupKey__"):
+            if not gkey: continue
+            cat = grp["__MatchKategori__"].iloc[0] if "__MatchKategori__" in grp.columns else ""
+            for bid in grp.get("BankRowID", pd.Series([], dtype=int)).tolist():
+                mapping_bank[bid] = (cat, gkey)
+    if not matched_bokf_all.empty and "__GroupKey__" in matched_bokf_all.columns:
+        for gkey, grp in matched_bokf_all.groupby("__GroupKey__"):
+            if not gkey: continue
+            cat = grp["__MatchKategori__"].iloc[0] if "__MatchKategori__" in grp.columns else ""
+            for fid in grp.get("BokfRowID", pd.Series([], dtype=int)).tolist():
+                mapping_bokf[fid] = (cat, gkey)
+    return mapping_bank, mapping_bokf
 
 # ================================= Main =================================
 def main():
@@ -757,97 +991,61 @@ def main():
     bank_rem = bank_all.copy()
     bokf_rem = bokf_all.copy()
     matched_bank_list, matched_bokf_list = [], []
+    counters = {}
 
+    # K1–K5
     for cat, func in [("K1",run_category1_BG53782751),
                       ("K2",run_category2_BG5341_7689),
                       ("K3",run_category3_35ref),
                       ("K4",run_category4_ovrigt),
                       ("K5",run_category5_LB)]:
-        mb, mf = func(bank_rem, bokf_rem)
-        if not mb.empty: mb = mb.copy(); mb["__MatchKategori__"] = cat
-        if not mf.empty: mf = mf.copy(); mf["__MatchKategori__"] = cat
-        matched_bank_list.append(mb); matched_bokf_list.append(mf)
-        if not mb.empty: bank_rem = bank_rem[~bank_rem["BankRowID"].isin(mb["BankRowID"])]
-        if not mf.empty: bokf_rem = bokf_rem[~bokf_rem["BokfRowID"].isin(mf["BokfRowID"])]
+        mb, mf = func(bank_rem, bokf_rem, counters)
+        if not mb.empty: matched_bank_list.append(mb); bank_rem = bank_rem[~bank_rem["BankRowID"].isin(mb["BankRowID"])]
+        if not mf.empty: matched_bokf_list.append(mf); bokf_rem = bokf_rem[~bokf_rem["BokfRowID"].isin(mf["BokfRowID"])]
 
-    # K6 på rester
-    mb6, mf6 = run_category6_symmetric(bank_rem, bokf_rem)
-    if not mb6.empty: mb6["__MatchKategori__"] = "K6"
-    if not mf6.empty: mf6["__MatchKategori__"] = "K6"
-    matched_bank_list.append(mb6); matched_bokf_list.append(mf6)
+    # K5X (ny, global balans – nu symmetrisk)
+    mb5x, mf5x = run_category5X_global(bank_rem, bokf_rem, counters)
+    if not mb5x.empty: matched_bank_list.append(mb5x); bank_rem = bank_rem[~bank_rem["BankRowID"].isin(mb5x["BankRowID"])]
+    if not mf5x.empty: matched_bokf_list.append(mf5x); bokf_rem = bokf_rem[~bokf_rem["BokfRowID"].isin(mf5x["BokfRowID"])]
 
-    matched_bank_all = pd.concat([d for d in matched_bank_list if not d.empty], ignore_index=True) if any((not d.empty for d in matched_bank_list)) else bank_all.iloc[0:0].copy()
-    matched_bokf_all = pd.concat([d for d in matched_bokf_list if not d.empty], ignore_index=True) if any((not d.empty for d in matched_bokf_list)) else bokf_all.iloc[0:0].copy()
+    # K6 (symmetrisk) på rester
+    mb6, mf6 = run_category6_symmetric(bank_rem, bokf_rem, counters)
+    if not mb6.empty: matched_bank_list.append(mb6)
+    if not mf6.empty: matched_bokf_list.append(mf6)
 
-    if "__MatchKategori__" not in matched_bank_all.columns: matched_bank_all["__MatchKategori__"] = pd.Series(dtype=str)
-    if "__MatchKategori__" not in matched_bokf_all.columns: matched_bokf_all["__MatchKategori__"] = pd.Series(dtype=str)
+    matched_bank_all = pd.concat(matched_bank_list, ignore_index=True) if matched_bank_list else bank_all.iloc[0:0].copy()
+    matched_bokf_all = pd.concat(matched_bokf_list, ignore_index=True) if matched_bokf_list else bokf_all.iloc[0:0].copy()
 
     om_bank_all = bank_all[~bank_all["BankRowID"].isin(matched_bank_all.get("BankRowID", pd.Series(dtype=int)))].copy()
     om_bokf_all = bokf_all[~bokf_all["BokfRowID"].isin(matched_bokf_all.get("BokfRowID", pd.Series(dtype=int)))].copy()
 
-    # MatchGruppID
-    mapping_bank, mapping_bokf = {}, {}
-
-    # K1, K2, K5 – grupp per datum
-    for cat in ["K1","K2","K5"]:
-        mb_cat = df_by_cat(matched_bank_all, cat)
-        mf_cat = df_by_cat(matched_bokf_all, cat)
-        for d in mb_cat["Bokföringsdatum"].dropna().dt.date.unique():
-            gid = f"{cat}-{extract_yymmdd(d)}-1"
-            for bid in mb_cat[mb_cat["Bokföringsdatum"].dt.date == d]["BankRowID"].tolist():
-                mapping_bank[bid] = (cat, gid)
-            for fid in mf_cat[mf_cat["Datum"].dt.date == d]["BokfRowID"].tolist():
-                mapping_bokf[fid] = (cat, gid)
-
-    # K3, K4 – parning 1–1
-    for cat in ["K3","K4"]:
-        mbc = df_by_cat(matched_bank_all, cat).reset_index(drop=True)
-        mfc = df_by_cat(matched_bokf_all, cat).reset_index(drop=True)
-        n = min(len(mbc), len(mfc))
-        for i in range(n):
-            gid = f"{cat}-{i+1:06d}"
-            mapping_bank[mbc.loc[i,"BankRowID"]] = (cat, gid)
-            mapping_bokf[mfc.loc[i,"BokfRowID"]] = (cat, gid)
-
-    # K6 – __GroupKey__
-    for side, df_all, mapping in [("Bank", matched_bank_all, mapping_bank),
-                                  ("Bokf", matched_bokf_all, mapping_bokf)]:
-        df_k6 = df_all[df_all["__MatchKategori__"] == "K6"] if "__MatchKategori__" in df_all.columns else df_all.iloc[0:0]
-        if not df_k6.empty and "__GroupKey__" in df_k6.columns:
-            for gkey, grp in df_k6.groupby("__GroupKey__"):
-                if side == "Bank":
-                    for bid in grp.get("BankRowID", pd.Series([], dtype=int)).tolist():
-                        mapping[bid] = ("K6", gkey)
-                else:
-                    for fid in grp.get("BokfRowID", pd.Series([], dtype=int)).tolist():
-                        mapping[fid] = ("K6", gkey)
+    mapping_bank, mapping_bokf = build_mapping_from_groupkey(matched_bank_all, matched_bokf_all)
 
     komb = build_combined_all(bank_all, bokf_all, mapping_bank, mapping_bokf)
 
     with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
-
         komb.to_excel(xw, index=False, sheet_name="Kombinerad", startrow=3)
+        # Om du vill lägga tillbaka omatchat/matchat-flikar, säg till så aktiverar vi dem igen.
 
     make_combined_sheet(Path(out_path))
     print(f"✅ Klar! Skrev: {out_path}")
 
 if __name__ == "__main__":
     main()
-
-# === Pipeline för webben: returnerar en XLSX som bytes ===
 from pathlib import Path
 import tempfile
 import pandas as pd
 
 def build_output_excel_bytes(bank_path: str, bokf_path: str) -> bytes:
-    # 1) Läs in
+    # 1) Läs källor
     bank_all = load_bank(bank_path)
     bokf_all = load_bokf(bokf_path)
 
-    # 2) K1–K5 på rester
+    # 2) Kör K1–K5 på rester (OBS: counters medföljer till varje kategori)
     bank_rem = bank_all.copy()
     bokf_rem = bokf_all.copy()
     matched_bank_list, matched_bokf_list = [], []
+    counters = {}
 
     for cat, func in [
         ("K1", run_category1_BG53782751),
@@ -856,98 +1054,37 @@ def build_output_excel_bytes(bank_path: str, bokf_path: str) -> bytes:
         ("K4", run_category4_ovrigt),
         ("K5", run_category5_LB),
     ]:
-        mb, mf = func(bank_rem, bokf_rem)
+        mb, mf = func(bank_rem, bokf_rem, counters)
         if not mb.empty:
-            mb = mb.copy()
-            mb["__MatchKategori__"] = cat
-        if not mf.empty:
-            mf = mf.copy()
-            mf["__MatchKategori__"] = cat
-        matched_bank_list.append(mb)
-        matched_bokf_list.append(mf)
-
-        if not mb.empty:
+            matched_bank_list.append(mb)
             bank_rem = bank_rem[~bank_rem["BankRowID"].isin(mb["BankRowID"])]
         if not mf.empty:
+            matched_bokf_list.append(mf)
             bokf_rem = bokf_rem[~bokf_rem["BokfRowID"].isin(mf["BokfRowID"])]
 
-    # 3) K6 på rester
-    mb6, mf6 = run_category6_symmetric(bank_rem, bokf_rem)
-    if not mb6.empty:
-        mb6["__MatchKategori__"] = "K6"
-    if not mf6.empty:
-        mf6["__MatchKategori__"] = "K6"
-    matched_bank_list.append(mb6)
-    matched_bokf_list.append(mf6)
+    # 3) K5X (global balans) – NY mellan K5 och K6
+    mb5x, mf5x = run_category5X_global(bank_rem, bokf_rem, counters)
+    if not mb5x.empty:
+        matched_bank_list.append(mb5x)
+        bank_rem = bank_rem[~bank_rem["BankRowID"].isin(mb5x["BankRowID"])]
+    if not mf5x.empty:
+        matched_bokf_list.append(mf5x)
+        bokf_rem = bokf_rem[~bokf_rem["BokfRowID"].isin(mf5x["BokfRowID"])]
 
-    # 4) Sammanställ alla matchade / omatchade
-    matched_bank_all = (
-        pd.concat([d for d in matched_bank_list if not d.empty], ignore_index=True)
-        if any((not d.empty for d in matched_bank_list))
-        else bank_all.iloc[0:0].copy()
-    )
-    matched_bokf_all = (
-        pd.concat([d for d in matched_bokf_list if not d.empty], ignore_index=True)
-        if any((not d.empty for d in matched_bokf_list))
-        else bokf_all.iloc[0:0].copy()
-    )
+    # 4) K6 (symmetrisk) på rester
+    mb6, mf6 = run_category6_symmetric(bank_rem, bokf_rem, counters)
+    if not mb6.empty: matched_bank_list.append(mb6)
+    if not mf6.empty: matched_bokf_list.append(mf6)
 
-    if "__MatchKategori__" not in matched_bank_all.columns:
-        matched_bank_all["__MatchKategori__"] = pd.Series(dtype=str)
-    if "__MatchKategori__" not in matched_bokf_all.columns:
-        matched_bokf_all["__MatchKategori__"] = pd.Series(dtype=str)
+    # 5) Slå ihop matchat + bygg mapping via __GroupKey__
+    matched_bank_all = (pd.concat(matched_bank_list, ignore_index=True)
+                        if matched_bank_list else bank_all.iloc[0:0].copy())
+    matched_bokf_all = (pd.concat(matched_bokf_list, ignore_index=True)
+                        if matched_bokf_list else bokf_all.iloc[0:0].copy())
 
-    om_bank_all = bank_all[
-        ~bank_all["BankRowID"].isin(matched_bank_all.get("BankRowID", pd.Series(dtype=int)))
-    ].copy()
-    om_bokf_all = bokf_all[
-        ~bokf_all["BokfRowID"].isin(matched_bokf_all.get("BokfRowID", pd.Series(dtype=int)))
-    ].copy()
+    mapping_bank, mapping_bokf = build_mapping_from_groupkey(matched_bank_all, matched_bokf_all)
 
-    # 5) Bygg MatchGruppID-mappning
-    mapping_bank, mapping_bokf = {}, {}
-
-    # K1, K2, K5 – grupp per datum
-    for cat in ["K1", "K2", "K5"]:
-        mb_cat = df_by_cat(matched_bank_all, cat)
-        mf_cat = df_by_cat(matched_bokf_all, cat)
-        for d in mb_cat["Bokföringsdatum"].dropna().dt.date.unique():
-            gid = f"{cat}-{extract_yymmdd(d)}-1"
-            for bid in mb_cat[mb_cat["Bokföringsdatum"].dt.date == d]["BankRowID"].tolist():
-                mapping_bank[bid] = (cat, gid)
-            for fid in mf_cat[mf_cat["Datum"].dt.date == d]["BokfRowID"].tolist():
-                mapping_bokf[fid] = (cat, gid)
-
-    # K3, K4 – 1–1
-    for cat in ["K3", "K4"]:
-        mbc = df_by_cat(matched_bank_all, cat).reset_index(drop=True)
-        mfc = df_by_cat(matched_bokf_all, cat).reset_index(drop=True)
-        n = min(len(mbc), len(mfc))
-        for i in range(n):
-            gid = f"{cat}-{i+1:06d}"
-            mapping_bank[mbc.loc[i, "BankRowID"]] = (cat, gid)
-            mapping_bokf[mfc.loc[i, "BokfRowID"]] = (cat, gid)
-
-    # K6 – från __GroupKey__
-    for side, df_all, mapping in [
-        ("Bank", matched_bank_all, mapping_bank),
-        ("Bokf", matched_bokf_all, mapping_bokf),
-    ]:
-        df_k6 = (
-            df_all[df_all["__MatchKategori__"] == "K6"]
-            if "__MatchKategori__" in df_all.columns
-            else df_all.iloc[0:0]
-        )
-        if not df_k6.empty and "__GroupKey__" in df_k6.columns:
-            for gkey, grp in df_k6.groupby("__GroupKey__"):
-                if side == "Bank":
-                    for bid in grp.get("BankRowID", pd.Series([], dtype=int)).tolist():
-                        mapping[bid] = ("K6", gkey)
-                else:
-                    for fid in grp.get("BokfRowID", pd.Series([], dtype=int)).tolist():
-                        mapping[fid] = ("K6", gkey)
-
-    # 6) Kombinera + formatera till Excel → returnera bytes
+    # 6) Bygg “Kombinerad”, formatera, returnera bytes
     komb = build_combined_all(bank_all, bokf_all, mapping_bank, mapping_bokf)
 
     with tempfile.TemporaryDirectory() as td:
@@ -956,4 +1093,3 @@ def build_output_excel_bytes(bank_path: str, bokf_path: str) -> bytes:
             komb.to_excel(xw, index=False, sheet_name="Kombinerad", startrow=3)
         make_combined_sheet(tmp_path)
         return tmp_path.read_bytes()
-
